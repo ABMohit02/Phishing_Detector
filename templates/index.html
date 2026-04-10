@@ -115,6 +115,52 @@
             color: #32d778;
         }
 
+        .detection-steps {
+            margin-top: 20px;
+            text-align: left;
+            background: rgba(255,255,255,0.05);
+            border: 1px solid rgba(255,255,255,0.1);
+            border-radius: 12px;
+            padding: 20px;
+            max-height: 300px;
+            overflow-y: auto;
+        }
+
+        .step {
+            display: flex;
+            gap: 12px;
+            padding: 12px 0;
+            border-bottom: 1px solid rgba(255,255,255,0.08);
+            font-size: 13px;
+            color: rgba(255,255,255,0.8);
+            animation: slideIn 0.3s ease;
+        }
+
+        .step:last-child {
+            border-bottom: none;
+        }
+
+        .step-icon {
+            min-width: 20px;
+            font-weight: bold;
+        }
+
+        .step-title {
+            font-weight: 600;
+            color: rgba(255,255,255,0.9);
+        }
+
+        .step-desc {
+            font-size: 12px;
+            color: rgba(255,255,255,0.6);
+            margin-top: 2px;
+        }
+
+        @keyframes slideIn {
+            from { opacity: 0; transform: translateX(-10px); }
+            to   { opacity: 1; transform: translateX(0); }
+        }
+
         @keyframes fadeIn {
             from { opacity: 0; transform: translateY(8px); }
             to   { opacity: 1; transform: translateY(0); }
@@ -146,9 +192,29 @@
             {% else %}
                 <div class="result safe">✅ Safe Website</div>
             {% endif %}
+
+            {% if steps is defined %}
+                <div class="detection-steps">
+                    <strong style="color: rgba(255,255,255,0.7); font-size: 12px;">Detection Details:</strong>
+                    {% for step_title, step_desc in steps %}
+                        <div class="step">
+                            <div class="step-icon">
+                                {% if step_title.startswith('✓') %}
+                                    ✓
+                                {% elif step_title.startswith('✗') %}
+                                    ✗
+                                {% else %}
+                                    ⚠
+                                {% endif %}
+                            </div>
+                            <div>
+                                <div class="step-title">{{ step_title.replace('✓ ', '').replace('✗ ', '').replace('⚠ ', '') }}</div>
+                                <div class="step-desc">{{ step_desc }}</div>
+                            </div>
+                        </div>
+                    {% endfor %}
+                </div>
+            {% endif %}
         {% endif %}
 
-        <p class="footer">Powered by Random Forest · 90% Accuracy</p>
-    </div>
-</body>
 </html>
