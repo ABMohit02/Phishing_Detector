@@ -1,0 +1,8 @@
+[phases.setup]
+nixpkgs = ["python313", "python313Packages.pip"]
+
+[phases.install]
+cmds = ["pip install --upgrade pip", "pip install -r requirements.txt"]
+
+[phases.build]
+cmds = []
