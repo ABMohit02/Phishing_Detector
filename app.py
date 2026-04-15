@@ -2,16 +2,40 @@ from flask import Flask, request, render_template
 import socket
 import whois
 import requests
+import base64
 from datetime import datetime, timezone
 from urllib.parse import urlparse
 
 app = Flask(__name__)
 
-# Known legitimate domains - only super major ones
+# ─── Whitelisted legitimate domains ───────────────────────────────────────────
+# These are expanded to prevent false positives from PhishTank's old records
 WHITELIST = [
     "google.com", "youtube.com", "facebook.com", "twitter.com", "instagram.com",
     "microsoft.com", "apple.com", "amazon.com", "wikipedia.org", "reddit.com",
+    "paypal.com", "ebay.com", "netflix.com", "linkedin.com", "github.com",
+    "stackoverflow.com", "twitch.tv", "discord.com", "spotify.com", "zoom.us",
+    "dropbox.com", "adobe.com", "salesforce.com", "shopify.com", "stripe.com",
+    "allegro.pl", "olx.pl", "walmart.com", "flipkart.com", "snapdeal.com",
 ]
+
+# ─── High-risk TLDs commonly used for phishing ────────────────────────────────
+SUSPICIOUS_TLDS = {
+    ".cyou", ".xyz", ".tk", ".ml", ".ga", ".cf", ".gq", ".top",
+    ".click", ".loan", ".work", ".date", ".faith", ".review",
+    ".stream", ".gdn", ".racing", ".win", ".download", ".accountant",
+    ".cricket", ".science", ".party", ".trade", ".webcam",
+}
+
+# ─── Brand names that phishing sites often impersonate ────────────────────────
+BRAND_KEYWORDS = [
+    "paypal", "amazon", "google", "apple", "microsoft", "netflix",
+    "facebook", "instagram", "twitter", "ebay", "allegro", "walmart",
+    "steam", "discord", "snapchat", "tiktok", "linkedin", "whatsapp",
+    "bank", "secure", "login", "signin", "account", "verify", "update",
+    "coinbase", "binance", "crypto", "blockchain",
+]
+
 
 def is_whitelisted(url):
     try:
@@ -19,6 +43,7 @@ def is_whitelisted(url):
         return any(hostname == d or hostname.endswith("." + d) for d in WHITELIST)
     except:
         return False
+
 
 def domain_resolves(url):
     """Returns True if the domain resolves to a valid IP."""
@@ -31,6 +56,38 @@ def domain_resolves(url):
         return True
     except (socket.gaierror, socket.timeout):
         return False
+
+
+def check_suspicious_tld(url):
+    """Returns True if the domain uses a high-risk TLD."""
+    try:
+        hostname = urlparse(url).hostname or ""
+        for tld in SUSPICIOUS_TLDS:
+            if hostname.endswith(tld):
+                return True, tld
+    except:
+        pass
+    return False, ""
+
+
+def check_brand_impersonation(url):
+    """Returns True if the domain contains brand names but isn't the real domain."""
+    try:
+        hostname = urlparse(url).hostname or ""
+        hostname_lower = hostname.lower()
+        for brand in BRAND_KEYWORDS:
+            if brand in hostname_lower:
+                # Check it's not the actual brand domain
+                # e.g. "paypal.com" is fine, "paypal.secure-login.xyz" is not
+                if not (hostname_lower == f"{brand}.com" or
+                        hostname_lower.endswith(f".{brand}.com") or
+                        hostname_lower == f"{brand}.pl" or
+                        hostname_lower.endswith(f".{brand}.pl")):
+                    return True, brand
+    except:
+        pass
+    return False, ""
+
 
 def check_whois(url):
     """Returns: 'no_exist', 'new', 'old', or 'unknown'"""
@@ -60,114 +117,177 @@ def check_whois(url):
             return 'no_exist'
         return 'unknown'
 
+
 def check_phishtank_live(url):
-    """Check if URL is in PhishTank database (LIVE)"""
+    """Check if URL is in PhishTank database (LIVE).
+    Flags any URL found in the database (in_database=True),
+    regardless of 'valid' status — because even taken-down phishing
+    domains are still dangerous."""
+    try:
+        url_encoded = base64.b64encode(url.encode()).decode()
+        response = requests.post(
+            "https://checkurl.phishtank.com/checkurl/",
+            data={
+                "url": url_encoded,
+                "format": "json",
+                "app_key": ""  # Optional: add your free PhishTank API key here
+            },
+            headers={"User-Agent": "phishtank/phishing_detector"},
+            timeout=8
+        )
+        print(f"  PhishTank status: {response.status_code}")
+        if response.status_code == 200:
+            data = response.json()
+            results = data.get("results", {})
+            print(f"  PhishTank result: in_database={results.get('in_database')}, valid={results.get('valid')}")
+            # Flag if PhishTank has EVER recorded this URL as phishing
+            if results.get("in_database"):
+                return True
+    except Exception as e:
+        print(f"  PhishTank error: {e}")
+    return False
+
+
+# ─── OpenPhish feed cache ──────────────────────────────────────────────────────
+_openphish_feed = set()
+_openphish_loaded = False
+
+
+def load_openphish_feed():
+    """Download the free OpenPhish feed (no API key needed)."""
+    global _openphish_feed, _openphish_loaded
     try:
         response = requests.get(
-            "https://phishtank.com/api/ioc/",
-            params={"url": url, "format": "json", "app_token": "phishing_detector_app"},
-            timeout=5
+            "https://openphish.com/feed.txt",
+            timeout=10,
+            headers={"User-Agent": "phishing-detector/1.0"}
         )
         if response.status_code == 200:
-            data = response.json()
-            if data.get("results") and len(data["results"]) > 0:
-                return True  # Found in phishing database
-    except:
-        pass
+            urls = set(line.strip() for line in response.text.splitlines() if line.strip())
+            _openphish_feed = urls
+            _openphish_loaded = True
+            print(f"  [OK] OpenPhish feed loaded: {len(urls)} URLs")
+            return True
+    except Exception as e:
+        print(f"  OpenPhish feed load error: {e}")
     return False
 
-def check_urlhaus_live(url):
-    """Check if URL is in URLhaus database (LIVE)"""
-    try:
-        response = requests.post(
-            "https://urlhaus-api.abuse.ch/v1/url/",
-            data={"url": url},
-            timeout=5
-        )
-        if response.status_code == 200:
-            data = response.json()
-            if data.get("query_status") == "ok" and data.get("threat"):
-                return True  # Found as malicious
-    except:
-        pass
-    return False
 
+def check_openphish(url):
+    """Check URL against OpenPhish free feed (no API key required)."""
+    global _openphish_loaded
+    if not _openphish_loaded:
+        load_openphish_feed()
+    url_stripped = url.strip().rstrip('/')
+    return url in _openphish_feed or url_stripped in _openphish_feed
+
+
+# ─── Main Route ───────────────────────────────────────────────────────────────
 @app.route("/", methods=["GET", "POST"])
 def home():
     if request.method == "POST":
-        url = request.form["url"]
-        print(f"\n🔍 Checking URL: {url}")
-        
+        url = request.form["url"].strip()
+        print(f"\n[SEARCH] Checking URL: {url}")
+
         detection_steps = []
-        
+
+        # ── Whitelist check ──────────────────────────────────────────────────
         if is_whitelisted(url):
-            print("✓ Whitelisted domain")
-            detection_steps.append(("✓ Whitelisted Domain", "This domain is known to be safe"))
+            print("[OK] Whitelisted domain")
+            detection_steps.append(("✓ Whitelisted Domain", "This domain is a known legitimate site"))
             result = "legitimate"
+
         else:
-            detection_steps.append(("⚠ Not on whitelist", "Running full checks..."))
-            
-            # Step 1: DNS check - if doesn't resolve, it's phishing
+            detection_steps.append(("⚠ Not on whitelist", "Running full security checks..."))
+
+            # ── Step 1: DNS Resolution ───────────────────────────────────────
             dns_ok = domain_resolves(url)
             if dns_ok:
-                print("✓ DNS check passed - domain exists")
-                detection_steps.append(("✓ DNS Resolution", "Domain exists and resolves to an IP"))
+                print("[OK] DNS check passed")
+                detection_steps.append(("✓ DNS Resolution", "Domain resolves to a valid IP"))
             else:
-                print("❌ DNS check failed - domain doesn't resolve")
-                detection_steps.append(("✗ DNS Resolution", "Domain doesn't resolve - likely phishing"))
+                print("[FAIL] DNS check failed")
+                detection_steps.append(("✗ DNS Resolution", "Domain doesn't resolve — likely a fake/dead site"))
                 result = "phishing"
                 return render_template("index.html", result=result, steps=detection_steps)
-            
-            # Step 2: Check LIVE PhishTank database
+
+            # ── Step 2: PhishTank database ───────────────────────────────────
             phishtank_check = check_phishtank_live(url)
             if phishtank_check:
-                print("❌ Found in PhishTank database")
-                detection_steps.append(("✗ PhishTank Database", "URL found in phishing database"))
+                print("[FAIL] Found in PhishTank database")
+                detection_steps.append(("✗ PhishTank Database", "URL is recorded in PhishTank's phishing database"))
                 result = "phishing"
                 return render_template("index.html", result=result, steps=detection_steps)
             else:
-                print("✓ Not in PhishTank")
-                detection_steps.append(("✓ PhishTank Check", "Not found in phishing database"))
-            
-            # Step 3: Check LIVE URLhaus database
-            urlhaus_check = check_urlhaus_live(url)
-            if urlhaus_check:
-                print("❌ Found in URLhaus database")
-                detection_steps.append(("✗ URLhaus Database", "URL flagged as malicious"))
+                print("[OK] Not in PhishTank")
+                detection_steps.append(("✓ PhishTank Check", "Not found in PhishTank database"))
+
+            # ── Step 3: OpenPhish feed ───────────────────────────────────────
+            openphish_check = check_openphish(url)
+            if openphish_check:
+                print("[FAIL] Found in OpenPhish feed")
+                detection_steps.append(("✗ OpenPhish Database", "URL found in active phishing feed"))
                 result = "phishing"
                 return render_template("index.html", result=result, steps=detection_steps)
             else:
-                print("✓ Not in URLhaus")
-                detection_steps.append(("✓ URLhaus Check", "Not found in malware database"))
-            
-            # Step 4: Check domain type
+                print("[OK] Not in OpenPhish")
+                detection_steps.append(("✓ OpenPhish Check", "Not found in OpenPhish phishing feed"))
+
+            # ── Step 4: Suspicious TLD check ────────────────────────────────
+            is_bad_tld, tld_found = check_suspicious_tld(url)
+            if is_bad_tld:
+                print(f"[FAIL] Suspicious TLD detected: {tld_found}")
+                detection_steps.append(("✗ Suspicious TLD", f"Domain uses high-risk TLD: {tld_found}"))
+                result = "phishing"
+                return render_template("index.html", result=result, steps=detection_steps)
+            else:
+                print("[OK] TLD looks normal")
+                detection_steps.append(("✓ TLD Check", "Domain extension is not high-risk"))
+
+            # ── Step 5: Brand impersonation check ───────────────────────────
+            is_impersonating, brand_found = check_brand_impersonation(url)
+            if is_impersonating:
+                print(f"[FAIL] Brand impersonation detected: {brand_found}")
+                detection_steps.append(("✗ Brand Impersonation", f"Domain impersonates '{brand_found}' but is not the real site"))
+                result = "phishing"
+                return render_template("index.html", result=result, steps=detection_steps)
+            else:
+                print("[OK] No brand impersonation detected")
+                detection_steps.append(("✓ Brand Check", "No known brand impersonation detected"))
+
+            # ── Step 6: Domain type check ────────────────────────────────────
             hostname = urlparse(url).hostname or ""
-            is_government_domain = any(hostname.endswith(ext) for ext in ['.gov', '.edu', '.org', '.gov.in', '.ac.in', '.nic.in'])
-            
-            if is_government_domain:
-                print(f"✓ Trusted domain type (.gov/.edu/.org)")
-                detection_steps.append(("✓ Domain Type", f"Trusted TLD ({hostname.split('.')[-1]})"))
+            is_trusted_tld = any(hostname.endswith(ext) for ext in ['.gov', '.edu', '.gov.in', '.ac.in', '.nic.in'])
+
+            if is_trusted_tld:
+                print(f"[OK] Trusted government/education domain")
+                detection_steps.append(("✓ Domain Type", f"Trusted government/education TLD"))
                 result = "legitimate"
             else:
-                # Step 5: WHOIS age check
+                # ── Step 7: WHOIS age check ──────────────────────────────────
                 whois_status = check_whois(url)
-                print(f"📋 WHOIS status: {whois_status}")
-                
+                print(f"[INFO] WHOIS status: {whois_status}")
+
                 if whois_status == 'new':
-                    print(f"❌ Domain is brand new (< 1 year old)")
-                    detection_steps.append(("✗ Domain Age", "Domain registered < 1 year ago (suspicious)"))
+                    print("[FAIL] Domain is brand new (< 1 year old)")
+                    detection_steps.append(("✗ Domain Age", "Domain registered < 1 year ago — highly suspicious"))
+                    result = "phishing"
+                elif whois_status == 'no_exist':
+                    print("[FAIL] No WHOIS record found")
+                    detection_steps.append(("✗ Domain Age", "No WHOIS record — domain may be fake or unregistered"))
                     result = "phishing"
                 else:
-                    print(f"✓ Domain age seems OK")
+                    print(f"[OK] Domain age OK ({whois_status})")
                     if whois_status == 'old':
                         detection_steps.append(("✓ Domain Age", "Domain is established (1+ years old)"))
                     else:
                         detection_steps.append(("✓ Domain Status", f"Domain status: {whois_status}"))
                     result = "legitimate"
-        
-        print(f"🎯 Result: {result}\n")
+
+        print(f"[RESULT] Result: {result}\n")
         return render_template("index.html", result=result, steps=detection_steps)
     return render_template("index.html")
+
 
 if __name__ == "__main__":
     app.run(debug=True)
