@@ -59,6 +59,52 @@ def domain_resolves(url):
         return False
 
 
+def is_safe_for_network(url):
+    """Checks if a URL is safe to contact (avoids SSRF)."""
+    try:
+        hostname = urlparse(url).hostname
+        if not hostname: return False
+        if hostname == 'localhost': return True # We have special logic for this
+        
+        # Resolve and check IP
+        ip_str = socket.gethostbyname(hostname)
+        ip = ipaddress.ip_address(ip_str)
+        
+        if (ip.is_loopback or ip.is_private or ip.is_multicast or 
+            ip.is_link_local or ip.is_reserved or ip.is_unspecified):
+            return False
+        return True
+    except:
+        return False
+
+
+def normalize_url(url):
+    """Converts a URL to its standard ASCII (Punycode) form."""
+    try:
+        parsed = urlparse(url)
+        hostname = parsed.hostname
+        if not hostname: return url
+        
+        # Convert hostname to IDNA (Punycode)
+        ascii_hostname = hostname.encode('idna').decode('ascii')
+        
+        # Reconstruct URL
+        return url.replace(hostname, ascii_hostname)
+    except:
+        return url
+
+
+def get_redirect_destination(url):
+    """Follows redirects to find the final landing page (Short link bypass)."""
+    try:
+        # Use HEAD to avoid downloading large bodies, follow redirects
+        # Strict timeout to avoid DoS
+        response = requests.head(url, allow_redirects=True, timeout=5, headers={"User-Agent": "phishing-detector/1.0"})
+        return response.url
+    except:
+        return url
+
+
 def is_local_address(url):
     """Returns True if the URL refers to localhost or a private IP range."""
     try:
@@ -99,18 +145,28 @@ def check_suspicious_tld(url):
 
 
 def check_brand_impersonation(url):
-    """Returns True if the domain contains brand names but isn't the real domain."""
+    """Returns True if the domain contains brand names (potentially fuzzy) but isn't the real domain."""
     try:
         hostname = urlparse(url).hostname or ""
         hostname_lower = hostname.lower()
+        
+        # Clean hostname for fuzzy matching
+        hostname_cleaned = hostname_lower
+        for char in ['-', '_', '.', ' ']:
+            hostname_cleaned = hostname_cleaned.replace(char, '')
+
         for brand in BRAND_KEYWORDS:
-            if brand in hostname_lower:
+            if brand in hostname_cleaned:
                 # Check it's not the actual brand domain
                 # e.g. "paypal.com" is fine, "paypal.secure-login.xyz" is not
                 if not (hostname_lower == f"{brand}.com" or
                         hostname_lower.endswith(f".{brand}.com") or
                         hostname_lower == f"{brand}.pl" or
-                        hostname_lower.endswith(f".{brand}.pl")):
+                        hostname_lower.endswith(f".{brand}.pl") or
+                        hostname_lower == f"{brand}.in" or
+                        hostname_lower.endswith(f".{brand}.in") or
+                        hostname_lower == f"{brand}.co.in" or
+                        hostname_lower.endswith(f".{brand}.co.in")):
                     return True, brand
     except:
         pass
@@ -217,6 +273,16 @@ def load_openphish_feed():
     return False
 
 
+@app.after_request
+def add_security_headers(response):
+    """Sets fundamental security headers for every response."""
+    response.headers['X-Frame-Options'] = 'DENY'
+    response.headers['X-Content-Type-Options'] = 'nosniff'
+    response.headers['Content-Security-Policy'] = "default-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self' https://fonts.gstatic.com;"
+    response.headers['Referrer-Policy'] = 'strict-origin-when-cross-origin'
+    return response
+
+
 def check_openphish(url):
     """Check URL against OpenPhish free feed (no API key required)."""
     global _openphish_loaded
@@ -230,11 +296,30 @@ def check_openphish(url):
 @app.route("/", methods=["GET", "POST"])
 def home():
     if request.method == "POST":
-        url = request.form["url"].strip()
-        print(f"\n[SEARCH] Checking URL: {url}")
+        input_url = request.form["url"].strip()
+        print(f"\n[SEARCH] Checking URL: {input_url}")
 
         detection_steps = []
+        
+        # ── Step 0: Normalization & SSRF Check ────────────────────────────────
+        url = normalize_url(input_url)
+        if url != input_url:
+            detection_steps.append(("⚠ Internationalized Domain", f"URL normalized to Punycode: {url}"))
+        
+        # ── Step 0.1: Local Address Check (User Requirement: Phishing) ───────
+        if is_local_address(url):
+            print("[FAIL] Local/Private address detected")
+            detection_steps.append(("✗ Local Address", "Personal/Local network addresses are restricted for security"))
+            result = "phishing"
+            return render_template("index.html", result=result, steps=detection_steps)
 
+        # ── Step 0.2: Redirect Tracing ───────────────────────────────────────
+        final_url = get_redirect_destination(url)
+        if final_url != url:
+            print(f"  [INFO] Redirect detected: {url} -> {final_url}")
+            detection_steps.append(("⚠ URL Redirect Detected", f"Following shortener/redirect to: {urlparse(final_url).hostname}"))
+            url = final_url # Analyze the landing page instead
+            
         # ── Whitelist check ──────────────────────────────────────────────────
         if is_whitelisted(url):
             print("[OK] Whitelisted domain")
@@ -244,14 +329,25 @@ def home():
         else:
             detection_steps.append(("⚠ Not on whitelist", "Running full security checks..."))
 
-            # ── Step 0: Local Address Check ──────────────────────────────────
-            if is_local_address(url):
-                print("[FAIL] Local/Private address detected")
-                detection_steps.append(("✗ Local Address", "Personal/Local network addresses are restricted for security"))
+            # ── Step 1: Brand Impersonation Check ───────────────────────────
+            is_impersonating, brand_found = check_brand_impersonation(url)
+            if is_impersonating:
+                print(f"[FAIL] Brand impersonation detected: {brand_found}")
+                detection_steps.append(("✗ Brand Impersonation", f"Domain impersonates '{brand_found}' but is not the real site"))
+                result = "phishing"
+                return render_template("index.html", result=result, steps=detection_steps)
+            else:
+                print("[OK] No brand impersonation detected")
+                detection_steps.append(("✓ Brand Check", "No known brand impersonation detected"))
+
+            # ── Step 2: SSRF/Network Safety ────────────────────────────────────
+            if not is_safe_for_network(url):
+                print("[FAIL] SSRF risk detected")
+                detection_steps.append(("✗ Network Security", "Targeting disallowed internal IP range"))
                 result = "phishing"
                 return render_template("index.html", result=result, steps=detection_steps)
 
-            # ── Step 1: DNS Resolution ───────────────────────────────────────
+            # ── Step 3: DNS Resolution ───────────────────────────────────────
             dns_ok = domain_resolves(url)
             if dns_ok:
                 print("[OK] DNS check passed")
@@ -295,18 +391,7 @@ def home():
                 print("[OK] TLD looks normal")
                 detection_steps.append(("✓ TLD Check", "Domain extension is not high-risk"))
 
-            # ── Step 5: Brand impersonation check ───────────────────────────
-            is_impersonating, brand_found = check_brand_impersonation(url)
-            if is_impersonating:
-                print(f"[FAIL] Brand impersonation detected: {brand_found}")
-                detection_steps.append(("✗ Brand Impersonation", f"Domain impersonates '{brand_found}' but is not the real site"))
-                result = "phishing"
-                return render_template("index.html", result=result, steps=detection_steps)
-            else:
-                print("[OK] No brand impersonation detected")
-                detection_steps.append(("✓ Brand Check", "No known brand impersonation detected"))
-
-            # ── Step 6: Domain type check ────────────────────────────────────
+            # ── Step 3: Domain type check ────────────────────────────────────
             hostname = urlparse(url).hostname or ""
             is_trusted_tld = any(hostname.endswith(ext) for ext in ['.gov', '.edu', '.gov.in', '.ac.in', '.nic.in'])
 
