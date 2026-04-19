@@ -5,6 +5,7 @@ import requests
 import base64
 from datetime import datetime, timezone
 from urllib.parse import urlparse
+import ipaddress
 
 app = Flask(__name__)
 
@@ -58,6 +59,33 @@ def domain_resolves(url):
         return False
 
 
+def is_local_address(url):
+    """Returns True if the URL refers to localhost or a private IP range."""
+    try:
+        hostname = urlparse(url).hostname
+        if not hostname:
+            return True  # Assume local if no hostname (e.g. relative path)
+
+        if hostname == 'localhost':
+            return True
+
+        # Check if it's an IP address
+        try:
+            ip = ipaddress.ip_address(hostname)
+            return ip.is_loopback or ip.is_private
+        except ValueError:
+            # Not a direct IP, try resolving it (with a short timeout)
+            try:
+                socket.setdefaulttimeout(1)
+                ip_str = socket.gethostbyname(hostname)
+                ip = ipaddress.ip_address(ip_str)
+                return ip.is_loopback or ip.is_private
+            except (socket.gaierror, socket.timeout):
+                return False
+    except:
+        return False
+
+
 def check_suspicious_tld(url):
     """Returns True if the domain uses a high-risk TLD."""
     try:
@@ -95,8 +123,22 @@ def check_whois(url):
         hostname = urlparse(url).hostname
         if not hostname:
             return 'no_exist'
+        
         parts = hostname.split('.')
-        root = '.'.join(parts[-2:]) if len(parts) >= 2 else hostname
+        if len(parts) >= 3:
+            # Common multi-level TLDs
+            multi_level_suffixes = {
+                'co.in', 'com.in', 'org.in', 'net.in', 'res.in', 'ac.in', 'gov.in', 'nic.in', 'ind.in',
+                'co.uk', 'com.au', 'com.br', 'com.cn'
+            }
+            last_two = '.'.join(parts[-2:])
+            if last_two in multi_level_suffixes:
+                root = '.'.join(parts[-3:])
+            else:
+                root = '.'.join(parts[-2:])
+        else:
+            root = '.'.join(parts[-2:]) if len(parts) >= 2 else hostname
+
         w = whois.whois(root)
         if not w or not w.domain_name:
             return 'no_exist'
@@ -115,6 +157,8 @@ def check_whois(url):
         err = str(e).lower()
         if 'no match' in err or 'not found' in err or 'no data' in err:
             return 'no_exist'
+        if 'returned no output' in err:
+            return 'not_applicable'
         return 'unknown'
 
 
@@ -199,6 +243,13 @@ def home():
 
         else:
             detection_steps.append(("⚠ Not on whitelist", "Running full security checks..."))
+
+            # ── Step 0: Local Address Check ──────────────────────────────────
+            if is_local_address(url):
+                print("[FAIL] Local/Private address detected")
+                detection_steps.append(("✗ Local Address", "Personal/Local network addresses are restricted for security"))
+                result = "phishing"
+                return render_template("index.html", result=result, steps=detection_steps)
 
             # ── Step 1: DNS Resolution ───────────────────────────────────────
             dns_ok = domain_resolves(url)
